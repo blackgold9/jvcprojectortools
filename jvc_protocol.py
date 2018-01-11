@@ -27,11 +27,11 @@ END = b'\x0a'
 
 class JVCConnection:
     """JVC projector low level command processing class"""
-    def __init__(self, print_cmd_send=False, print_cmd_res=False, print_all=False, **args):
+    def __init__(self, print_cmd_send=False, print_cmd_res=False, print_all=False, host, **args):
         self.print_cmd_send = print_cmd_send or print_all
         self.print_cmd_res = print_cmd_res or print_all
         self.print_cmd_bin_res = print_all
-        self.conn = jvc_network.JVCNetwork(print_all=print_all, **args)
+        self.conn = jvc_network.JVCNetwork(print_all=print_all, host=host, **args)
         self.reconnect = False
 
     def __enter__(self):
