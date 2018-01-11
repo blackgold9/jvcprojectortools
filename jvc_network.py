@@ -7,7 +7,7 @@ import select
 import socket
 import dumpdata
 
-conf_file = 'jvc_network.conf'
+DEFAULT_PORT = 20554
 
 class Error(Exception):
     """Error"""
@@ -23,11 +23,12 @@ class Timeout(Exception):
 
 class JVCNetwork:
     """JVC projector network connection"""
-    def __init__(self, print_all=False, print_recv=False, print_send=False):
+    def __init__(self, print_all=False, print_recv=False, print_send=False, host):
         self.print_recv = print_recv or print_all
         self.print_send = print_send or print_all
         self.socket = None
         self.host_port = None
+        self.host = host    
 
     def connect(self):
         """Open network connection to projector and perform handshake"""
@@ -44,55 +45,22 @@ class JVCNetwork:
         self.send(b'PJREQ')
         self.expect(b'PJACK')
 
-    def __enter__(self):
-        try:
-            with open(conf_file, 'r') as f:
-                conf = json.load(f)
-        except:
-            conf = dict()
-        save_conf = False
-
+    def __enter__(self):        
         while True:
-            if not conf.get('host', None):
-                print('\nIf you have configured a hostname for your projector (usually in your\n'
-                      'internet gateway) enter that hostname here.\n'
-                      'If you don'"'"'t have a hostname, you can use the "IP Address" displayed \n'
-                      'in the "Network" menu (found under the "Function" main menu) on the\n'
-                      'projector. If "DHCP Client" is "Off" change it to "On" then select "Set"\n'
-                      'to have the "IP Address" information filled out.\n')
-                conf['host'] = input('Enter hostname or ip address: ')
-                save_conf = True
-
-            if not conf.get('port', None):
-                conf['port'] = 20554
-                save_conf = True
-
+            if not self.host:
+                print('\nError: The host address has not been set\n')                     
             try:
-                self.host_port = (conf['host'], conf['port'])
+                self.host_port = (self.host, DEFAULT_PORT)
                 self.connect()
             except Exception as err:
-                print('Failed to connect to {}:{}'.format(conf['host'], conf['port']))
+                print('Failed to connect to {}:{}'.format(self.host, DEFAULT_PORT))
                 if isinstance(err, Error):
                     print(err.args[1])
                 else:
                     print(err)
-
-                print('\nCheck that nothing else is connected, as the projector only supports a\n'
-                      'single connection at a time. Then enter "r" to retry with the same network\n'
-                      'network address, enter "n" to try a new network address, or enter "a" to')
-                ret = input('abort. [r/n/a]: ')
-                if ret == 'n':
-                    conf['host'] = None
-                    conf['port'] = None
-                    continue
-                if ret == 'r':
-                    continue
+               
                 raise err
             break
-
-        if save_conf:
-            with open(conf_file, 'w') as f:
-                json.dump(conf, f)
 
         return self
 
