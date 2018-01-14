@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 """JVC projector low level command module"""
 
@@ -28,6 +29,7 @@ class Model(ReadOnly, Enum):
     DLA_X550R_X5000_XC5890R_RS400 = b'ILAFPJ -- XHP1'
     DLA_XC6890 = b'ILAFPJ -- XHP2'
     DLA_X750R_X7000_XC7890R_RS500_X950R_X9000_RS600_PX1 = b'ILAFPJ -- XHP3'
+    DLA_X770R = b'ILAFPJ -- XHR3'
 
 def s8_bytes_to_list(bstr):
     """Convert 8bit signed bytes to list"""
@@ -262,6 +264,11 @@ class LampPower(Enum):
     Normal = b'0'
     High = b'1'
 
+class LowLatency(Enum):
+    """Low Latency Setting"""
+    Off = b'0'
+    On = b'1'
+
 class MPCAnalyze(Enum):
     """MPC Analyze Mode"""
     Off = b'0'
@@ -349,8 +356,8 @@ class Command(Enum):
     Power = b'PW', PowerState # Power [PoWer]
     Input = b'IP', InputState # Input [InPut]
     Remote = b'RC', RemoteCode # Remote control code through [Remote Code]
-    SetupCom = b'SURS' # Initial setup [SetUp] external control compatible command protocol
-    SetupIR = b'SURC' # Initial setup [SetUp] IR code
+    SetupCom = b'SURS', # Initial setup [SetUp] external control compatible command protocol
+    SetupIR = b'SURC', # Initial setup [SetUp] IR code
     GammaRed = b'GR', CustomGammaTable # Gamma data (Red) of the Gamma table ”Custom 1/2/3”
     GammaGreen = b'GG', CustomGammaTable # Gamma data (Green) of the Gamma table ”Custom 1/2/3”
     GammaBlue = b'GB', CustomGammaTable # Gamma data (Blue) of the Gamma table ”Custom 1/2/3”
@@ -420,6 +427,7 @@ class Command(Enum):
     BrightnessBlue = b'PMLB', Numeric # Brightness (Blue) adjustment
     BrightnessMagenta = b'PMLM', Numeric # Brightness (Magenta) adjustment
     ClearMotionDrive = b'PMCM', ClearMotionDrive # Clear Motion Drive
+    LowLatency = b'PMLL', LowLatency # Low Latency mode
     MotionEnhance = b'PMME', MotionEnhance # Motion Enhance
     LensAperture = b'PMLA', Numeric # Lens Aperture
     LampPower = b'PMLP', LampPower # Lamp Power
@@ -528,11 +536,11 @@ class Command(Enum):
 
 class JVCCommand:
     """JVC projector low level command processing class"""
-    def __init__(self, print_cmd_send=False, print_cmd_res=False, print_all=False, **args):
+    def __init__(self, host, print_cmd_send=False, print_cmd_res=False, print_all=False, **args):
         self.print_cmd_send = print_cmd_send or print_all
         self.print_cmd_res = print_cmd_res or print_all
         self.print_cmd_bin_res = print_all
-        self.conn = jvc_protocol.JVCConnection(print_all=print_all, **args)
+        self.conn = jvc_protocol.JVCConnection(print_all=print_all, host=host, **args)
 
     def __enter__(self):
         self.conn.__enter__()

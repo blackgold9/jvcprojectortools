@@ -23,7 +23,7 @@ class Timeout(Exception):
 
 class JVCNetwork:
     """JVC projector network connection"""
-    def __init__(self, print_all=False, print_recv=False, print_send=False, host):
+    def __init__(self, host, print_all=False, print_recv=False, print_send=False):
         self.print_recv = print_recv or print_all
         self.print_send = print_send or print_all
         self.socket = None
