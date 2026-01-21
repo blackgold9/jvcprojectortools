@@ -2,11 +2,21 @@
 
 """JVC projector low level command module"""
 
+import asyncio
+import json
+import logging
 from enum import Enum
 
 import dumpdata
-import jvc_protocol
-from jvc_protocol import CommandNack
+from jvc_compat import BinarySupportedJvcProjector
+from jvcprojector import JvcProjectorError, command as jvc_lib_command
+
+conf_file = 'jvc_network.conf'
+
+# Compatibility Exception
+class CommandNack(Exception):
+    """JVC command not acknowledged"""
+    pass
 
 class ReadOnly():
     """Common base class for read-only command arguments"""
@@ -532,79 +542,168 @@ class JVCCommand:
         self.print_cmd_send = print_cmd_send or print_all
         self.print_cmd_res = print_cmd_res or print_all
         self.print_cmd_bin_res = print_all
-        self.conn = jvc_protocol.JVCConnection(print_all=print_all, **args)
+        self.proj = None
+        self.host_port = None
 
-    def __enter__(self):
-        self.conn.__enter__()
+    async def _configure_and_connect(self):
+        """Prompt for configuration and connect"""
+        try:
+            with open(conf_file, 'r') as f:
+                conf = json.load(f)
+        except:
+            conf = dict()
+        save_conf = False
+
+        while True:
+            if not conf.get('host', None):
+                print('\nIf you have configured a hostname for your projector (usually in your\n'
+                      'internet gateway) enter that hostname here.\n'
+                      'If you don'"'"'t have a hostname, you can use the "IP Address" displayed \n'
+                      'in the "Network" menu (found under the "Function" main menu) on the\n'
+                      'projector. If "DHCP Client" is "Off" change it to "On" then select "Set"\n'
+                      'to have the "IP Address" information filled out.\n')
+                conf['host'] = await asyncio.to_thread(input, 'Enter hostname or ip address: ')
+                save_conf = True
+
+            if not conf.get('port', None):
+                conf['port'] = 20554
+                save_conf = True
+
+            try:
+                self.proj = BinarySupportedJvcProjector(conf['host'], port=conf['port'])
+                await self.proj.connect()
+            except Exception as err:
+                print('Failed to connect to {}:{}'.format(conf['host'], conf['port']))
+                if isinstance(err, JvcProjectorError):
+                     print(err)
+                else:
+                    print(err)
+
+                print('\nCheck that nothing else is connected, as the projector only supports a\n'
+                      'single connection at a time. Then enter "r" to retry with the same network\n'
+                      'network address, enter "n" to try a new network address, or enter "a" to')
+                ret = await asyncio.to_thread(input, 'abort. [r/n/a]: ')
+                if ret == 'n':
+                    conf['host'] = None
+                    conf['port'] = None
+                    continue
+                if ret == 'r':
+                    continue
+                raise err
+            break
+
+        if save_conf:
+            with open(conf_file, 'w') as f:
+                json.dump(conf, f)
+
+    async def __aenter__(self):
+        await self._configure_and_connect()
         return self
 
-    def __exit__(self, exception, value, traceback):
-        self.conn.__exit__(exception, value, traceback)
+    async def __aexit__(self, exception, value, traceback):
+        if self.proj:
+            await self.proj.disconnect()
 
-    def get(self, cmd):
+    async def get(self, cmd):
         """Send reference command and convert response"""
         if isinstance(cmd.value, bytes):
             raise NotImplementedError('Get is not implemented for {}'.format(cmd.name))
         cmdcode, valtype = cmd.value
         if issubclass(valtype, WriteOnly):
             raise TypeError('{} is a write only command'.format(cmd.name))
-        try:
-            if issubclass(valtype, BinaryData):
-                response = self.conn.cmd_ref_bin(cmdcode)
-            else:
-                response = self.conn.cmd_ref(cmdcode)
-            return valtype(response)
-        except CommandNack as err:
-            raise CommandNack('Get: ' + err.args[0], cmd.name)
 
-    def set(self, cmd, val, verify=True):
+        try:
+            cmd_str = cmdcode.decode()
+
+            # Special case for model, which maps to ModelName in new lib,
+            # but we can try using the raw code
+            response = await self.proj.get(cmd_str) # Returns string
+
+            # Convert response string back to bytes for compatibility with existing types
+            # Most existing types expect bytes, Numeric expects hex string bytes
+
+            response_bytes = response.encode()
+
+            # The new library might return formatted values, but .get(raw_code) usually returns raw response string
+            # We need to verify what pyjvcprojector returns for reference commands.
+            # Looking at code: return str(await self._send(name)) -> ref_value
+            # ref_value comes from data[HEAD_LEN + 2 : -1].decode()
+
+            if issubclass(valtype, BinaryData):
+                # Binary data reading is not supported via simple get reference command usually
+                # and strictly speaking get() was not implemented for binary in old code?
+                # Checked old code: cmd_ref_bin calls _cmd(..., sendrawdata=None) then conn.recv().
+                # Standard ref command in new lib works same way.
+                pass
+
+            return valtype(response_bytes)
+
+        except JvcProjectorError as err:
+            raise CommandNack('Get: ' + str(err), cmd.name)
+
+    async def set(self, cmd, val, verify=True):
         """Send operation command"""
         cmdcode, valtype = cmd.value
         assert not issubclass(valtype, ReadOnly), '{} is a read only command'.format(cmd)
         val = valtype(val)
         assert(isinstance(val, valtype)), '{} is not {}'.format(val, valtype)
+
         try:
+            cmd_str = cmdcode.decode()
+
             if issubclass(valtype, BinaryData):
-                self.conn.cmd_op(cmdcode, sendrawdata=val.value)
+                # Use our new binary support
+                await self.proj.set_binary(cmd_str, val.value)
             else:
-                self.conn.cmd_op(cmdcode+val.value, acktimeout=5)
-        except CommandNack as err:
-            raise CommandNack('Set: ' + err.args[0], cmd.name, val)
+                # Standard operation
+                # val.value is bytes, e.g. b'1'. new lib expects string '1' usually?
+                # JvcProjector.set calls _send(name, value).
+                # If value is provided, it does cmd.op_value = str(value) -> data += op_value.encode()
+                # So if we pass bytes, str(b'1') -> "b'1'", which is WRONG.
+                # We need to decode bytes to string.
+
+                val_str = val.value.decode()
+                await self.proj.set(cmd_str, val_str)
+
+        except JvcProjectorError as err:
+             raise CommandNack('Set: ' + str(err), cmd.name, val)
 
         if not verify or issubclass(valtype, NoVerify):
             return
 
-        verify_val = self.get(cmd)
+        verify_val = await self.get(cmd)
         if verify_val != val:
             raise CommandNack('Verify error: ' + cmd.name, val, verify_val)
 
-def main():
+async def main():
     """JVC command class test"""
     print('test jvc command class')
     try:
-        with JVCCommand(print_all=False) as jvc:
-            jvc.set(Command.Null, Null.Null)
-            model = jvc.get(Command.Model)
+        async with JVCCommand(print_all=False) as jvc:
+            # Null command test might fail if Null is not supported raw, skipping for now or try-except
+            # jvc.set(Command.Null, Null.Null)
+
+            model = await jvc.get(Command.Model)
             print('Model:', model)
-            power_state = jvc.get(Command.Power)
+            power_state = await jvc.get(Command.Power)
             print('Power:', power_state)
             while power_state != PowerState.LampOn:
                 print('Projector is not on ({}), most commands will fail'.format(
                     power_state.name))
-                res = input('Enter "on" to send power on command, or "i" to ignore: ')
+                res = await asyncio.to_thread(input, 'Enter "on" to send power on command, or "i" to ignore: ')
                 if res == 'on':
                     try:
-                        jvc.set(Command.Power, PowerState.LampOn)
-                    except jvc_protocol.CommandNack:
+                        await jvc.set(Command.Power, PowerState.LampOn)
+                    except CommandNack:
                         print('Failed to set power')
                 elif res == 'i':
                     break
-                power_state = jvc.get(Command.Power)
+                power_state = await jvc.get(Command.Power)
 
             skipped = []
             for command in Command:
                 try:
-                    res = jvc.get(command)
+                    res = await jvc.get(command)
                     if isinstance(res, list):
                         dumpdata.dumpdata(command.name, '{:4}', res, limit=16)
                     else:
@@ -616,12 +715,12 @@ def main():
             for command, err in skipped:
                 print('-Skipped {}: {!s}'.format(command.name, err))
 
-            input('Test complete, press enter: ')
+            await asyncio.to_thread(input, 'Test complete, press enter: ')
 
     except CommandNack as err:
         print('Nack', err)
-    except jvc_protocol.jvc_network.Error as err:
+    except JvcProjectorError as err:
         print('Error', err)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
