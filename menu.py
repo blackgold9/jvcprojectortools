@@ -2,11 +2,12 @@
 
 """JVC projector tool menu"""
 
+import asyncio
 import math
 import sys
 import threading
 import traceback
-from distutils.util import strtobool
+import inspect
 
 import eotf
 import plot
@@ -74,19 +75,23 @@ GAMMA_PRESETS = [
     ('projector black level bright test', GAMMA_BLACK_LEVEL_BRIGHT_TEST),
     ]
 
-def input_ask(prompt, allowed):
+async def async_input(prompt):
+    """Async wrapper for input"""
+    return await asyncio.to_thread(input, prompt)
+
+async def input_ask(prompt, allowed):
     """Ask for input until a valid response is given"""
     while True:
-        val = input(prompt)
+        val = await async_input(prompt)
         if val in allowed:
             return val
 
-def input_num(prompt, low, high, numtype=float, data=None):
+async def input_num(prompt, low, high, numtype=float, data=None):
     """Read a number and its range"""
     for _ in range(5):
         try:
             if data is None:
-                strval = input('{} [{},{}]: '.format(prompt, low, high))
+                strval = await async_input('{} [{},{}]: '.format(prompt, low, high))
             else:
                 strval = data
                 data = None
@@ -102,7 +107,7 @@ def input_num(prompt, low, high, numtype=float, data=None):
         except ValueError:
             print('Bad input', strval)
 
-def select_menu_item(prompt, items, cmdindex=0, nameindex=1, maxsplit=0,
+async def select_menu_item(prompt, items, cmdindex=0, nameindex=1, maxsplit=0,
                      multiselect=False, cmdsep=None, data=None):
     """Select menu item(s)"""
     readinput = data is None
@@ -124,7 +129,7 @@ def select_menu_item(prompt, items, cmdindex=0, nameindex=1, maxsplit=0,
 
     for _ in range(3):
         try:
-            line = (input(prompt) if readinput else data).strip()
+            line = (await async_input(prompt) if readinput else data).strip()
             if multiselect:
                 cmds = line.split(sep=cmdsep)
             else:
@@ -154,19 +159,21 @@ def select_menu_item(prompt, items, cmdindex=0, nameindex=1, maxsplit=0,
             prompt = 'No such item, try again: '
     raise KeyError
 
-def run_menu_item(name, func, arg):
+async def run_menu_item(name, func, arg):
     """Run the function for a menu item and allow retry on exceptions"""
     try:
         while True:
             try:
-                func(arg)
+                res = func(arg)
+                if inspect.isawaitable(res):
+                    await res
                 return None
             except plot.PlotClosed:
                 return None
             except Exception as err:
                 print(name, 'failed', err)
 
-                res = input_ask('Ignore (i), retry (r) or abort (a): ', {'i', 'r', 'a', 's'})
+                res = await input_ask('Ignore (i), retry (r) or abort (a): ', {'i', 'r', 'a', 's'})
                 if res == 'a':
                     return err
                 if res == 'i':
@@ -190,7 +197,9 @@ class MenuThread(threading.Thread):
 
     def run(self):
         try:
-            self.menu.run()
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self.menu.run())
         except BaseException as err:
             self.exception = ExceptionInThread(err, sys.exc_info())
         finally:
@@ -218,90 +227,78 @@ class Menu():
         except FileNotFoundError:
             pass
         except Exception:
-            if not strtobool(input('Failed to load gamma curve.\n'
-                                   'Ignore error and continue (y/n)? ')):
+            # We are in __init__, which is sync, but we need user input.
+            # Using standard input is fine here as it blocks the main thread before the loop starts/or in sync context.
+            # However, if we want to be consistent... but standard input is safer for simplicity in __init__.
+            val = input('Failed to load gamma curve.\n'
+                                   'Ignore error and continue (y/n)? ').lower()
+            if val not in ('y', 'yes', 't', 'true', 'on', '1'):
                 raise
 
-        while self.run_plot_open is not None:
+        # Instead of while loop here, we need to defer running to run() or start()
+        # But existing code logic runs menu loop in init until plot opens.
+        # We will change this so main() calls run().
+
+    async def run_loop(self):
+         while self.run_plot_open is not None:
             plot_open = self.run_plot_open
             self.run_plot_open = None
             if plot_open:
-                self.run_with_plot()
+                # We can't really run a thread from an async loop easily and wait for it properly if it runs an event loop too.
+                # But existing code logic spawns a thread for the menu loop so the plot (turtle) can run in main thread.
+                # Turtle must run in main thread.
+                # So if plot_open is true, we must return to main, start the plot, and spawn a thread for the menu.
+                # This architecture is tricky with asyncio.
+
+                # If we are here, we are already inside an asyncio loop (likely from MenuThread or main).
+                # If we are in MenuThread, we can't start Turtle. Turtle must be main thread.
+
+                # Let's assume the user is starting from main() -> Menu().run() (which is sync wrapper/setup).
+                pass
             else:
-                self.run()
+                await self.run()
 
-    def run_with_plot(self):
-        """Open plot window and run menu in thread"""
-        thread = MenuThread(self)
-        self.plot = plot.Plot()
-        try:
-            thread.start()
-            self.plot.run()
-        finally:
-            thread.join()
-            self.plot = None
-            if thread.exception is not None:
-                raise thread.exception
-
-    def load(self, basename):
-        """Load gamma curve from file"""
-        self.gamma.file_load(basename)
-
-    def save(self, basename):
-        """Save gamma curve to file"""
-        self.gamma.file_save(basename)
-
-    def itostr(self, value):
-        """Convert gamma table index to input brightness"""
-        try:
-            p = self.gamma.itop(value)
-            if p < 0:
-                raise ValueError
-            b = self.gamma.eotf.L(p) * self.gamma.eotf.peak
-            return '{:.5g} cd/m²'.format(b)
-        except:
-            return ''
-
-    def preset_gamma_menu_select(self, _):
+    async def preset_gamma_menu_select(self, _):
         """Load gamma curve from build in preset"""
         menu = [(None, name, param) for name, param in GAMMA_PRESETS]
         menu.append(('q', '--abort--', {}))
 
-        _, _, sel = select_menu_item('Select preset: ', menu, cmdindex=0, nameindex=1)
+        _, _, sel = await select_menu_item('Select preset: ', menu, cmdindex=0, nameindex=1)
         self.gamma.conf_load(sel)
 
-    def setup_hdr(self, _):
+    async def setup_hdr(self, _):
         """HDR setup helper"""
         try:
-            with JVCCommand() as jvc:
+            async with JVCCommand() as jvc:
                 try:
-                    model = jvc.get(Command.Model)
+                    model = await jvc.get(Command.Model)
                     print('Found projector model:', model.name)
                 except ValueError:
-                    if not strtobool(input('Unknown projector model.\n'
-                                           'Ignore and continue (y/n)? ')):
+                    val = await async_input('Unknown projector model.\n'
+                                            'Ignore and continue (y/n)? ')
+                    if val.lower() not in ('y', 'yes', 't', 'true', 'on', '1'):
                         raise
                 while True:
-                    power_state = jvc.get(Command.Power)
+                    power_state = await jvc.get(Command.Power)
                     if power_state != PowerState.LampOn:
                         print('Make sure projector is powered on and ready. Current state is:',
                               power_state.name)
-                        res = input('Press enter to retry '
+                        res = await async_input('Press enter to retry '
                                     '(or enter "on" to send power on command): ')
                         if res == 'on':
-                            if jvc.get(Command.Power) == PowerState.StandBy:
-                                jvc.set(Command.Power, PowerState.LampOn)
+                            if await jvc.get(Command.Power) == PowerState.StandBy:
+                                await jvc.set(Command.Power, PowerState.LampOn)
                             else:
                                 print('Not in StandBy, try again')
                         continue
-                    input_level = jvc.get(Command.HDMIInputLevel)
+                    input_level = await jvc.get(Command.HDMIInputLevel)
                     break
                 while True:
                     print('Set "Picture Mode" to the User mode you want to program for HDR')
                     print('Set "Gamma" to "Custom 1", "Custom 2" or "Custom 3"')
-                    input('Press enter when ready: ')
-                    user_mode = jvc.get(Command.PictureMode)
-                    gamma_table = jvc.get(Command.GammaTable)
+                    await async_input('Press enter when ready: ')
+                    user_mode = await jvc.get(Command.PictureMode)
+                    gamma_table = await jvc.get(Command.GammaTable)
                     if user_mode not in {PictureMode.User1, PictureMode.User2,
                                          PictureMode.User3, PictureMode.User4,
                                          PictureMode.User5, PictureMode.User6}:
@@ -311,24 +308,24 @@ class Menu():
                                            GammaTable.Custom3}:
                         print('Invalid "Gamma":', gamma_table.name)
                         continue
-                    gamma_correction = jvc.get(Command.GammaCorrection)
+                    gamma_correction = await jvc.get(Command.GammaCorrection)
                     if gamma_correction != GammaCorrection.Import:
                         print('Switching {} from {} to {}'.format(
                             gamma_table.name, gamma_correction.name, GammaCorrection.Import.name))
-                        jvc.set(Command.GammaCorrection, GammaCorrection.Import)
+                        await jvc.set(Command.GammaCorrection, GammaCorrection.Import)
                     print('Selected', user_mode.name, gamma_table.name, gamma_correction.name)
                     break
 
             self.gamma.conf_load(GAMMA_HDR_DEFAULT)
             self.gamma.set_input_level(input_level)
 
-            self.set_source_brightness_contrast()
-            self.hdr_contrast_menu()
+            await self.set_source_brightness_contrast()
+            await self.hdr_contrast_menu()
 
         except CommandNack as err:
             print('Nack', err)
 
-    def set_source_brightness_contrast(self, _=None):
+    async def set_source_brightness_contrast(self, _=None):
         """Load a gamma curve to help adjusting brightness and contrast on a source device"""
         gamma = GammaCurve()
         gamma.set_input_level(HDMIInputLevel.Enhanced)
@@ -341,28 +338,28 @@ class Menu():
         gamma.eotf = eotf.eotf_gamma_2_2
 
         print('\nDisplay a test pattern where you can clearly identify black and white')
-        input('Press enter when ready load test gamma curve: ')
+        await async_input('Press enter when ready load test gamma curve: ')
         saved_input_level = None
         try:
-            with JVCCommand() as jvc:
-                saved_input_level = jvc.get(Command.HDMIInputLevel)
+            async with JVCCommand() as jvc:
+                saved_input_level = await jvc.get(Command.HDMIInputLevel)
                 if saved_input_level != HDMIInputLevel.Enhanced:
                     print('Changing input level from {} to Enhanced'.format(saved_input_level.name))
-                    jvc.set(Command.HDMIInputLevel, HDMIInputLevel.Enhanced)
-                gamma.write_jvc(jvc, verify=self.verify)
-                jvc.set(Command.Contrast, 0)
-                jvc.set(Command.Brightness, 0)
+                    await jvc.set(Command.HDMIInputLevel, HDMIInputLevel.Enhanced)
+                await gamma.write_jvc(jvc, verify=self.verify)
+                await jvc.set(Command.Contrast, 0)
+                await jvc.set(Command.Brightness, 0)
 
             print('Adjust contrast and brightness on your source so black and white turn green')
-            input('Press enter when done: ')
+            await async_input('Press enter when done: ')
         finally:
             if saved_input_level:
-                with JVCCommand() as jvc:
-                    if saved_input_level != jvc.get(Command.HDMIInputLevel):
+                async with JVCCommand() as jvc:
+                    if saved_input_level != await jvc.get(Command.HDMIInputLevel):
                         print('Changing input level from Enhanced to {}'.format(
                             saved_input_level.name))
-                        jvc.set(Command.HDMIInputLevel, saved_input_level)
-            self.gamma.write(verify=self.verify)
+                        await jvc.set(Command.HDMIInputLevel, saved_input_level)
+            await self.gamma.write(verify=self.verify)
 
     def contrast_to_brefwhite(self, contrast):
         """Calculate brefwhite (for contrast 0) value based on specified contrast setting"""
@@ -373,7 +370,7 @@ class Menu():
             self.gamma.brefwhite, brefwhite, bsc_old, bsc_new))
         self.gamma.brefwhite = brefwhite
 
-    def hdr_contrast_menu(self, _=None, gamma_table_loaded=False):
+    async def hdr_contrast_menu(self, _=None, gamma_table_loaded=False):
         """Adjust brightness of reference white by using contrast control on projector"""
         print('After loading a gamma table, use the contrast control on the projector to\n'
               'increase or decrease the brightness of the picture. Large adjustments distorts\n'
@@ -381,40 +378,40 @@ class Menu():
               'adustments\n'
               'When done, leave the contrast at 0')
         while True:
-            with JVCCommand() as jvc:
+            async with JVCCommand() as jvc:
                 if gamma_table_loaded:
-                    contrast = jvc.get(Command.Contrast)
+                    contrast = await jvc.get(Command.Contrast)
                     print('Contrast', contrast)
                     if contrast == 0:
-                        jvc.set(Command.Remote, RemoteCode.Back)
+                        await jvc.set(Command.Remote, RemoteCode.Back)
                         break
 
                     self.contrast_to_brefwhite(contrast)
 
                 print('Please wait while loading gamma table')
                 try:
-                    jvc.set(Command.Remote, RemoteCode.Back)
-                    self.gamma.write_jvc(jvc, verify=self.verify)
-                    jvc.set(Command.Contrast, 0)
+                    await jvc.set(Command.Remote, RemoteCode.Back)
+                    await self.gamma.write_jvc(jvc, verify=self.verify)
+                    await jvc.set(Command.Contrast, 0)
                     gamma_table_loaded = True
-                    jvc.set(Command.Remote, RemoteCode.PictureAdjust)
+                    await jvc.set(Command.Remote, RemoteCode.PictureAdjust)
                 except Exception as err:
                     print('Failed to load gamma table', err)
-                    ret = input('Press enter to retry or enter "a" to abort: ')
+                    ret = await async_input('Press enter to retry or enter "a" to abort: ')
                     if ret == 'a':
                         return
                     continue
-            input('Gamma table ready. Make your adjustments and press enter when ready: ')
+            await async_input('Gamma table ready. Make your adjustments and press enter when ready: ')
 
     def input_mode_show(self):
         """Return input mode to show in menu"""
         return 'Input Level: {} (Must match Input Signal Menu)'.format(
             self.gamma.get_input_level().name)
 
-    def input_mode_select(self, arg):
+    async def input_mode_select(self, arg):
         """Select input mode"""
         menu = [(e.name[:2].lower(), e.name, e) for e in HDMIInputLevel]
-        _, _, input_level = select_menu_item('Select Input Level: ', menu, data=arg)
+        _, _, input_level = await select_menu_item('Select Input Level: ', menu, data=arg)
         self.gamma.set_input_level(input_level)
 
     def show_highlight(self):
@@ -422,7 +419,7 @@ class Menu():
         return 'Highlight regions (current %s)' % self.gamma.highlight
 
     #@staticmethod
-    def select_highlight(self, arg):
+    async def select_highlight(self, arg):
         """Select highlight flags"""
         menu = [
             ('c', 'Clear All', Highlight.NONE, True),
@@ -445,7 +442,7 @@ class Menu():
             ]
         done = bool(arg)
         while True:
-            selected = select_menu_item('Toggle: ', menu, multiselect=True, data=arg)
+            selected = await select_menu_item('Toggle: ', menu, multiselect=True, data=arg)
             for _, _, sel, force in selected:
                 if sel is None:
                     done = True
@@ -460,7 +457,7 @@ class Menu():
                     self.gamma.highlight = None
                 return
 
-    def eotf_menu_select(self, arg):
+    async def eotf_menu_select(self, arg):
         """Select eotf if arg matches a unique entry. Build and run a select menu otherwise"""
         menu = []
         matched = None
@@ -472,7 +469,7 @@ class Menu():
         if matched:
             self.gamma.eotf = matched
         else:
-            _, _, self.gamma.eotf = select_menu_item('Select preset: ', menu)
+            _, _, self.gamma.eotf = await select_menu_item('Select preset: ', menu)
 
     def eotf_black_menu_show(self):
         """Return black level compensation in eotf to show in menu"""
@@ -481,12 +478,12 @@ class Menu():
             black = black * self.gamma.bmax
         return 'eotf black compensation: {}'.format(black)
 
-    def eotf_black_menu_select(self, arg):
+    async def eotf_black_menu_select(self, arg):
         """Set black level compensation in eotf"""
         if not hasattr(self.gamma.eotf, 'set_black'):
             print('not available')
         else:
-            black = input_num('black level (nits):', 0.0, 5.0, data=arg)
+            black = await input_num('black level (nits):', 0.0, 5.0, data=arg)
             self.gamma.eotf.set_black(black / self.gamma.bmax)
 
     def show_softclip(self):
@@ -498,10 +495,10 @@ class Menu():
             paramstr = bsoftclip
         return 'Set soft clip start: {} ({})'.format(self.gamma.get_effective_bsoftclip(), paramstr)
 
-    def select_softclip(self, arg):
+    async def select_softclip(self, arg):
         """Set softclip start value(s)"""
         if not arg:
-            arg = input('enter bsoftclip or bbase bmin scale hcscale: ')
+            arg = await async_input('enter bsoftclip or bbase bmin scale hcscale: ')
         args = arg.split(' ')
         if len(args) == 1:
             self.gamma.bsoftclip = float(args[0])
@@ -730,7 +727,7 @@ class Menu():
             ('Pr', 'Read raw table from projector', lambda _: self.gamma.read()),
             ]
 
-    def run(self):
+    async def run(self):
         """Run menu"""
         gammahist = []
 
@@ -764,18 +761,18 @@ class Menu():
                 ('x', 'Quit and save current gamma parameters [confname]', self.save),
                 ]
 
-            for sel, *args in select_menu_item('Select operation: ', menu,
+            for sel, *args in await select_menu_item('Select operation: ', menu,
                                                cmdindex=0, nameindex=1, maxsplit=1, cmdsep=';'):
                 args = iter(args)
                 arg = next(args, None)
                 if sel[2]:
-                    if run_menu_item(sel[1], sel[2], arg) is not None:
+                    if await run_menu_item(sel[1], sel[2], arg) is not None:
                         break
                     if sel[0] in ('x', 'q!'):
                         return
                 else:
                     numtype = float if isinstance(sel[4], float) else int
-                    val = input_num(*sel[3:], numtype=numtype, data=arg)
+                    val = await input_num(*sel[3:], numtype=numtype, data=arg)
                     if val is not None:
                         self.gamma.set(sel[3], val)
                         self.replot = True
@@ -807,11 +804,55 @@ class Menu():
             except plot.PlotClosed:
                 pass
 
+    # Methods required for plotting (sync) need to remain sync or be handled carefully
+    # The plot library uses Tkinter/Turtle which is sync.
+    # We call self.plot.plot() etc. These are non-blocking queueing operations in plot.py, so they are fine to call from async loop?
+    # Yes, plot.py puts in a queue.
+
+    def load(self, basename):
+        """Load gamma curve from file"""
+        self.gamma.file_load(basename)
+
+    def save(self, basename):
+        """Save gamma curve to file"""
+        self.gamma.file_save(basename)
+
+    def itostr(self, value):
+        """Convert gamma table index to input brightness"""
+        try:
+            p = self.gamma.itop(value)
+            if p < 0:
+                raise ValueError
+            b = self.gamma.eotf.L(p) * self.gamma.eotf.peak
+            return '{:.5g} cd/m²'.format(b)
+        except:
+            return ''
+
+    def run_with_plot(self):
+        """Open plot window and run menu in thread"""
+        thread = MenuThread(self)
+        self.plot = plot.Plot()
+        try:
+            thread.start()
+            self.plot.run()
+        finally:
+            thread.join()
+            self.plot = None
+            if thread.exception is not None:
+                raise thread.exception
+
 def main():
     """JVC Projector tools main menu"""
     while True:
         try:
-            Menu()
+            m = Menu()
+            while m.run_plot_open is not None:
+                plot_open = m.run_plot_open
+                m.run_plot_open = None
+                if plot_open:
+                    m.run_with_plot()
+                else:
+                    asyncio.run(m.run())
             break
         except Exception as err:
             if isinstance(err, ExceptionInThread):
@@ -820,12 +861,14 @@ def main():
                 exc = sys.exc_info()
             print(err)
             try:
-                if strtobool(input('error occured print stack trace? ')):
+                val = input('error occured print stack trace? ').lower()
+                if val in ('y', 'yes', 't', 'true', 'on', '1'):
                     traceback.print_exception(*exc)
             except:
                 pass
             try:
-                if not strtobool(input('restart? ')):
+                val = input('restart? ').lower()
+                if val not in ('y', 'yes', 't', 'true', 'on', '1'):
                     break
             except:
                 break

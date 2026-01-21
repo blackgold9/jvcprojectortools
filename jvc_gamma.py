@@ -2,10 +2,10 @@
 
 """JVC projector low level command module"""
 
+import asyncio
 import json
 import enum
 import math
-from distutils.util import strtobool
 
 import dumpdata
 import eotf
@@ -63,11 +63,11 @@ def oscale(l):
         oi = omax
     return oi
 
-def write_gamma_curve(jvc, colorcmd, table, verify, retry=1):
+async def write_gamma_curve(jvc, colorcmd, table, verify, retry=1):
     """Write gamma curve for a single color to projector"""
     while True:
         try:
-            jvc.set(colorcmd, table, verify=verify)
+            await jvc.set(colorcmd, table, verify=verify)
             break
         except Exception as err:
             print('Failed to send {}, {}'.format(colorcmd.name, err))
@@ -139,8 +139,9 @@ class GammaCurve():
         if not self.raw_gamma_table():
             self.generate_table()
             if table is not None and table != self.table:
-                if strtobool(input('Imported table does not match generated table\n'
-                                   'Use imported raw table instead (y/n)? ')):
+                val = input('Imported table does not match generated table\n'
+                                   'Use imported raw table instead (y/n)? ').lower()
+                if val in ('y', 'yes', 't', 'true', 'on', '1'):
                     self.set_raw_table(table)
 
     def file_load(self, basename=None):
@@ -427,27 +428,27 @@ class GammaCurve():
             self.generate_table()
         return self.table
 
-    def write_jvc(self, jvc, verify=False):
+    async def write_jvc(self, jvc, verify=False):
         """Write gamma table to projector"""
         newgamma = self.get_table()
         if len(newgamma) != 3:
             newgamma = [newgamma, newgamma, newgamma]
 
         try:
-            print('Picture mode:', jvc.get(Command.PictureMode).name)
-            old_gamma_table = jvc.get(Command.GammaTable)
+            print('Picture mode:', (await jvc.get(Command.PictureMode)).name)
+            old_gamma_table = await jvc.get(Command.GammaTable)
             print('Gamma Table:', old_gamma_table.name)
             if old_gamma_table not in {GammaTable.Custom1,
                                        GammaTable.Custom2,
                                        GammaTable.Custom3}:
                 raise ValueError('Selected gamma table, {}, is not a custom gamma table'.format(
                     old_gamma_table.name))
-            gamma_correction = jvc.get(Command.GammaCorrection)
+            gamma_correction = await jvc.get(Command.GammaCorrection)
             if gamma_correction is not GammaCorrection.Import:
                 raise ValueError('Correction value for {} is not set to import, {}'.format(
                     old_gamma_table.name, gamma_correction.name))
-            jvc.set(Command.GammaCorrection, GammaCorrection.Import)
-            input_level_match = input_level = jvc.get(Command.HDMIInputLevel)
+            await jvc.set(Command.GammaCorrection, GammaCorrection.Import)
+            input_level_match = input_level = await jvc.get(Command.HDMIInputLevel)
             if input_level_match is HDMIInputLevel.Auto:
                 input_level_match = HDMIInputLevel.Standard
             if input_level_match != self.get_input_level():
@@ -456,36 +457,37 @@ class GammaCurve():
                                      input_level.name, self.get_input_level().name))
         except Exception as err:
             print('Failed to validate projector settings:', err)
-            if not strtobool(input('Ignore and try to write table anyway (y/n)? ')):
+            val = await asyncio.to_thread(input, 'Ignore and try to write table anyway (y/n)? ')
+            if val.lower() not in ('y', 'yes', 't', 'true', 'on', '1'):
                 raise
 
         for colorcmd, table in zip([Command.PMGammaRed, Command.PMGammaGreen, Command.PMGammaBlue],
                                    newgamma):
-            write_gamma_curve(jvc=jvc, colorcmd=colorcmd, table=table, verify=verify)
+            await write_gamma_curve(jvc=jvc, colorcmd=colorcmd, table=table, verify=verify)
 
         self.file_save(basename='written-{}'.format(old_gamma_table.name), save_all_params=False)
 
-    def write(self, verify=False):
+    async def write(self, verify=False):
         """Connect to projector and write gamma table"""
-        with JVCCommand() as jvc:
-            self.write_jvc(jvc, verify=verify)
+        async with JVCCommand() as jvc:
+            await self.write_jvc(jvc, verify=verify)
 
-    def read_jvc(self, jvc):
+    async def read_jvc(self, jvc):
         """Read gamma table from projector"""
-        gamma_correction = jvc.get(Command.GammaCorrection)
+        gamma_correction = await jvc.get(Command.GammaCorrection)
         assert gamma_correction is GammaCorrection.Import, \
                'Gamma correction must be set to Import not {}'.format(gamma_correction)
-        gamma_red = jvc.get(Command.GammaRed)
-        gamma_green = jvc.get(Command.GammaGreen)
-        gamma_blue = jvc.get(Command.GammaBlue)
+        gamma_red = await jvc.get(Command.GammaRed)
+        gamma_green = await jvc.get(Command.GammaGreen)
+        gamma_blue = await jvc.get(Command.GammaBlue)
         if gamma_red == gamma_green == gamma_blue:
             self.set_raw_table(gamma_red)
         self.set_raw_table((gamma_red, gamma_green, gamma_blue))
 
-    def read(self):
+    async def read(self):
         """Connect to projector and read gamma table"""
-        with JVCCommand() as jvc:
-            self.read_jvc(jvc)
+        async with JVCCommand() as jvc:
+            await self.read_jvc(jvc)
 
 def test_match(name, table, expected):
     """Test if generated gamma curve matches expected result"""
