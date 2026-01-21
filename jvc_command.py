@@ -615,26 +615,11 @@ class JVCCommand:
         try:
             cmd_str = cmdcode.decode()
 
-            # Special case for model, which maps to ModelName in new lib,
-            # but we can try using the raw code
-            response = await self.proj.get(cmd_str) # Returns string
-
-            # Convert response string back to bytes for compatibility with existing types
-            # Most existing types expect bytes, Numeric expects hex string bytes
-
-            response_bytes = response.encode()
-
-            # The new library might return formatted values, but .get(raw_code) usually returns raw response string
-            # We need to verify what pyjvcprojector returns for reference commands.
-            # Looking at code: return str(await self._send(name)) -> ref_value
-            # ref_value comes from data[HEAD_LEN + 2 : -1].decode()
-
             if issubclass(valtype, BinaryData):
-                # Binary data reading is not supported via simple get reference command usually
-                # and strictly speaking get() was not implemented for binary in old code?
-                # Checked old code: cmd_ref_bin calls _cmd(..., sendrawdata=None) then conn.recv().
-                # Standard ref command in new lib works same way.
-                pass
+                response_bytes = await self.proj.raw_get_binary(cmd_str)
+            else:
+                # Use raw get to bypass library translation
+                response_bytes = await self.proj.raw_get(cmd_str)
 
             return valtype(response_bytes)
 
@@ -655,15 +640,9 @@ class JVCCommand:
                 # Use our new binary support
                 await self.proj.set_binary(cmd_str, val.value)
             else:
-                # Standard operation
-                # val.value is bytes, e.g. b'1'. new lib expects string '1' usually?
-                # JvcProjector.set calls _send(name, value).
-                # If value is provided, it does cmd.op_value = str(value) -> data += op_value.encode()
-                # So if we pass bytes, str(b'1') -> "b'1'", which is WRONG.
-                # We need to decode bytes to string.
-
+                # Standard operation using raw set to bypass library translation
                 val_str = val.value.decode()
-                await self.proj.set(cmd_str, val_str)
+                await self.proj.raw_set(cmd_str, val_str)
 
         except JvcProjectorError as err:
              raise CommandNack('Set: ' + str(err), cmd.name, val)

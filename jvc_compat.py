@@ -10,9 +10,12 @@ from jvcprojector import command
 from jvcprojector.device import (
     Device,
     HEAD_OP,
+    HEAD_REF,
+    HEAD_RES,
     HEAD_ACK,
     UNIT_ID,
     END,
+    HEAD_LEN,
     JvcProjectorReadWriteTimeoutError,
     JvcProjectorError,
 )
@@ -22,7 +25,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class BinarySupportedDevice(Device):
-    """Device class with support for binary data transmission."""
+    """Device class with support for binary data transmission and raw commands."""
 
     async def send_binary(self, command_code: str, data: bytes) -> None:
         """Send a binary command to the device.
@@ -33,10 +36,6 @@ class BinarySupportedDevice(Device):
         3. Send Raw Data
         4. Receive ACK
         """
-        # Create a dummy command object just for lock management/throttling logic compatibility if needed,
-        # but we'll likely implement the raw send logic here similar to _send.
-
-        # We use the internal lock and connection directly.
         async with self._lock:
             if self._keepalive:
                 self._keepalive.cancel()
@@ -47,14 +46,14 @@ class BinarySupportedDevice(Device):
                 await self._connect()
 
             # Construct Operation Command
-            cmd_packet = HEAD_OP + UNIT_ID + command_code.encode() + END
+            cmd_packet = HEAD_OP + command_code.encode() + END
 
             _LOGGER.debug("Sending binary op header: %s", cmd_packet)
             await self._conn.write(cmd_packet)
 
             # 2. Receive First ACK
-            # The ACK format is usually HEAD_ACK + UNIT_ID + CODE
-            expected_ack_start = HEAD_ACK + UNIT_ID + command_code.encode()[0:2]
+            # The ACK format is usually HEAD_ACK + CODE
+            expected_ack_start = HEAD_ACK + command_code.encode()[0:2]
 
             try:
                 # Timeout for ACK
@@ -91,6 +90,148 @@ class BinarySupportedDevice(Device):
 
             _LOGGER.debug("Received data ack: %s", final_ack)
 
+    async def exec_raw_op(self, command_code: str, value: str = "") -> None:
+        """Execute a raw operation command (non-binary)."""
+        async with self._lock:
+            if self._keepalive:
+                self._keepalive.cancel()
+                self._keepalive = None
+
+            if not self._conn.is_connected():
+                await self._connect()
+
+            cmd_bytes = command_code.encode()
+            val_bytes = value.encode() if value else b""
+
+            # Construct: ! + UNIT_ID + CODE + VALUE + END
+            cmd_packet = HEAD_OP + cmd_bytes + val_bytes + END
+
+            _LOGGER.debug("Sending raw op: %s", cmd_packet)
+            await self._conn.write(cmd_packet)
+
+            expected_ack_start = HEAD_ACK + cmd_bytes[0:2]
+
+            try:
+                ack_data = await self._conn.readline(timeout=5.0)
+            except asyncio.TimeoutError as e:
+                raise JvcProjectorReadWriteTimeoutError(
+                    f"Read timeout waiting for ACK for raw command {command_code}"
+                ) from e
+
+            if not ack_data.startswith(expected_ack_start):
+                 raise JvcProjectorError(
+                    f"Invalid ack '{ack_data!r}' for raw command {command_code}"
+                )
+
+            _LOGGER.debug("Received ack: %s", ack_data)
+
+    async def exec_raw_ref(self, command_code: str) -> bytes:
+        """Execute a raw reference command and return response body bytes."""
+        async with self._lock:
+            if self._keepalive:
+                self._keepalive.cancel()
+                self._keepalive = None
+
+            if not self._conn.is_connected():
+                await self._connect()
+
+            cmd_bytes = command_code.encode()
+
+            # Construct: ? + UNIT_ID + CODE + END
+            cmd_packet = HEAD_REF + cmd_bytes + END
+
+            _LOGGER.debug("Sending raw ref: %s", cmd_packet)
+            await self._conn.write(cmd_packet)
+
+            expected_ack_start = HEAD_ACK + cmd_bytes[0:2]
+            expected_res_start = HEAD_RES + cmd_bytes[0:2]
+
+            # 1. Receive ACK
+            try:
+                ack_data = await self._conn.readline(timeout=5.0)
+            except asyncio.TimeoutError as e:
+                raise JvcProjectorReadWriteTimeoutError(
+                    f"Read timeout waiting for ACK for raw ref {command_code}"
+                ) from e
+
+            if not ack_data.startswith(expected_ack_start):
+                 raise JvcProjectorError(
+                    f"Invalid ack '{ack_data!r}' for raw ref {command_code}"
+                )
+
+            _LOGGER.debug("Received ack: %s", ack_data)
+
+            # 2. Receive Response
+            try:
+                res_data = await self._conn.readline(timeout=5.0)
+            except asyncio.TimeoutError as e:
+                raise JvcProjectorReadWriteTimeoutError(
+                    f"Read timeout waiting for response for raw ref {command_code}"
+                ) from e
+
+            _LOGGER.debug("Received raw response: %s", res_data)
+
+            if not res_data.startswith(expected_res_start):
+                 raise JvcProjectorError(
+                    f"Invalid response header '{res_data!r}' for raw ref {command_code}"
+                )
+
+            # Extract bytes value
+            # DEBUG
+            # print(f"DEBUG: HEAD_LEN={HEAD_LEN}, res_data={res_data}, slice_start={HEAD_LEN + 2}")
+            value_bytes = res_data[HEAD_LEN + 2 : -1]
+            return value_bytes
+
+    async def exec_raw_ref_binary(self, command_code: str) -> bytes:
+        """Execute a raw reference command for binary data retrieval."""
+        async with self._lock:
+            if self._keepalive:
+                self._keepalive.cancel()
+                self._keepalive = None
+
+            if not self._conn.is_connected():
+                await self._connect()
+
+            cmd_bytes = command_code.encode()
+
+            # Construct: ? + UNIT_ID + CODE + END
+            cmd_packet = HEAD_REF + cmd_bytes + END
+
+            _LOGGER.debug("Sending raw ref binary: %s", cmd_packet)
+            await self._conn.write(cmd_packet)
+
+            expected_ack_start = HEAD_ACK + cmd_bytes[0:2]
+
+            # 1. Receive ACK
+            try:
+                ack_data = await self._conn.readline(timeout=5.0)
+            except asyncio.TimeoutError as e:
+                raise JvcProjectorReadWriteTimeoutError(
+                    f"Read timeout waiting for ACK for raw ref binary {command_code}"
+                ) from e
+
+            if not ack_data.startswith(expected_ack_start):
+                 raise JvcProjectorError(
+                    f"Invalid ack '{ack_data!r}' for raw ref binary {command_code}"
+                )
+
+            _LOGGER.debug("Received ack: %s", ack_data)
+
+            # 2. Receive Binary Data (no readline, just read)
+            try:
+                # Read up to 1024 bytes as per old protocol logic
+                data = await self._conn.read(1024)
+            except asyncio.TimeoutError as e:
+                raise JvcProjectorReadWriteTimeoutError(
+                    f"Read timeout waiting for binary data for {command_code}"
+                ) from e
+
+            if not data:
+                 raise JvcProjectorReadWriteTimeoutError("Connection closed or empty response")
+
+            _LOGGER.debug("Received binary data (%d bytes)", len(data))
+            return data
+
 
 class BinarySupportedJvcProjector(JvcProjector):
     """JVC Projector with binary command support."""
@@ -100,22 +241,12 @@ class BinarySupportedJvcProjector(JvcProjector):
         if self._device:
             return
 
-        # Override the device instantiation to use our subclass
         self._device = BinarySupportedDevice(
             self._host, self._port, self._timeout, self._password
         )
 
-        # The rest is copied from the base class connect method logic
-        # We can reuse the base class logic for model detection if we assume self._device is set.
-        # However, JvcProjector.connect creates a Device() instance directly.
-        # So we basically have to duplicate the logic or call super and then swap?
-        # Calling super().connect() would create a standard Device.
-        # So we duplicate the init logic here.
-
         self._model = model if model else await self.get(command.ModelName)
 
-        # Import SPECIFICATIONS locally to avoid circular imports if they exist,
-        # or just rely on what we imported from command
         from jvcprojector.command.command import SPECIFICATIONS, Spec
         from jvcprojector.command.base import LIMP_MODE
 
@@ -143,9 +274,30 @@ class BinarySupportedJvcProjector(JvcProjector):
         """Send a binary command."""
         if not self._device:
             raise JvcProjectorError("Not connected")
-
-        # Verify it is our binary device
         if not isinstance(self._device, BinarySupportedDevice):
              raise JvcProjectorError("Device does not support binary commands")
-
         await self._device.send_binary(command_code, data)
+
+    async def raw_set(self, command_code: str, value: str = "") -> None:
+        """Send a raw operation command."""
+        if not self._device:
+            raise JvcProjectorError("Not connected")
+        if not isinstance(self._device, BinarySupportedDevice):
+             raise JvcProjectorError("Device does not support raw commands")
+        await self._device.exec_raw_op(command_code, value)
+
+    async def raw_get(self, command_code: str) -> bytes:
+        """Send a raw reference command and get raw response bytes."""
+        if not self._device:
+            raise JvcProjectorError("Not connected")
+        if not isinstance(self._device, BinarySupportedDevice):
+             raise JvcProjectorError("Device does not support raw commands")
+        return await self._device.exec_raw_ref(command_code)
+
+    async def raw_get_binary(self, command_code: str) -> bytes:
+        """Send a raw reference command and get binary response bytes."""
+        if not self._device:
+            raise JvcProjectorError("Not connected")
+        if not isinstance(self._device, BinarySupportedDevice):
+             raise JvcProjectorError("Device does not support raw commands")
+        return await self._device.exec_raw_ref_binary(command_code)
